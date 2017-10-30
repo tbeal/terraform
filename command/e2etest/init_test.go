@@ -3,6 +3,7 @@ package e2etest
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -113,6 +114,18 @@ func TestInit_fromModule(t *testing.T) {
 	tf := e2e.NewBinary(terraformBin, fixturePath)
 	defer tf.Close()
 
+	// force git to use https for testing from environments without ssh keys
+	dotGit := tf.Path(".git")
+	if err := os.Mkdir(dotGit, 0755); err != nil {
+		t.Fatal(err)
+	}
+	gitConfig := filepath.Join(dotGit, "config")
+	if err := ioutil.WriteFile(gitConfig, []byte(`[url "https://github.com/"]
+	insteadOf = ssh://git@github.com/`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	os.Setenv("GIT_CONFIG", gitConfig)
 	cmd := tf.Cmd("init", "-from-module=hashicorp/vault/aws")
 	cmd.Stdin = nil
 	cmd.Stderr = &bytes.Buffer{}
