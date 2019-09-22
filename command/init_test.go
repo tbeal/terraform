@@ -1,8 +1,10 @@
 package command
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,9 +13,19 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mitchellh/cli"
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/backend/local"
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/helper/copy"
 	"github.com/hashicorp/terraform/plugin/discovery"
-	"github.com/mitchellh/cli"
+	"github.com/hashicorp/terraform/state"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/states/statemgr"
+	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/tfdiags"
 )
 
 func TestInit_empty(t *testing.T) {
@@ -57,6 +69,10 @@ func TestInit_multipleArgs(t *testing.T) {
 
 func TestInit_fromModule_explicitDest(t *testing.T) {
 	dir := tempDir(t)
+	err := os.Mkdir(dir, os.ModePerm)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ui := new(cli.MockUi)
 	c := &InitCommand{
@@ -64,6 +80,15 @@ func TestInit_fromModule_explicitDest(t *testing.T) {
 			testingOverrides: metaOverridesForProvider(testProvider()),
 			Ui:               ui,
 		},
+	}
+
+	if _, err := os.Stat(DefaultStateFilename); err == nil {
+		// This should never happen; it indicates a bug in another test
+		// is causing a terraform.tfstate to get left behind in our directory
+		// here, which can interfere with our init process in a way that
+		// isn't relevant to this test.
+		fullPath, _ := filepath.Abs(DefaultStateFilename)
+		t.Fatalf("some other test has left terraform.tfstate behind:\n%s", fullPath)
 	}
 
 	args := []string{
@@ -123,6 +148,10 @@ func TestInit_fromModule_dstInSrc(t *testing.T) {
 	}
 	defer os.Chdir(cwd)
 
+	if err := os.Mkdir("foo", os.ModePerm); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := os.Create("issue518.tf"); err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -170,8 +199,8 @@ func TestInit_get(t *testing.T) {
 
 	// Check output
 	output := ui.OutputWriter.String()
-	if !strings.Contains(output, "Get: file://") {
-		t.Fatalf("doesn't look like get: %s", output)
+	if !strings.Contains(output, "foo in foo") {
+		t.Fatalf("doesn't look like we installed module 'foo': %s", output)
 	}
 }
 
@@ -203,7 +232,7 @@ func TestInit_getUpgradeModules(t *testing.T) {
 
 	// Check output
 	output := ui.OutputWriter.String()
-	if !strings.Contains(output, "(update)") {
+	if !strings.Contains(output, "Upgrading modules...") {
 		t.Fatalf("doesn't look like get upgrade: %s", output)
 	}
 }
@@ -241,7 +270,9 @@ func TestInit_backendUnset(t *testing.T) {
 	defer testChdir(t, td)()
 
 	{
-		ui := new(cli.MockUi)
+		log.Printf("[TRACE] TestInit_backendUnset: beginning first init")
+
+		ui := cli.NewMockUi()
 		c := &InitCommand{
 			Meta: Meta{
 				testingOverrides: metaOverridesForProvider(testProvider()),
@@ -254,6 +285,9 @@ func TestInit_backendUnset(t *testing.T) {
 		if code := c.Run(args); code != 0 {
 			t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
 		}
+		log.Printf("[TRACE] TestInit_backendUnset: first init complete")
+		t.Logf("First run output:\n%s", ui.OutputWriter.String())
+		t.Logf("First run errors:\n%s", ui.ErrorWriter.String())
 
 		if _, err := os.Stat(filepath.Join(DefaultDataDir, DefaultStateFilename)); err != nil {
 			t.Fatalf("err: %s", err)
@@ -261,12 +295,14 @@ func TestInit_backendUnset(t *testing.T) {
 	}
 
 	{
+		log.Printf("[TRACE] TestInit_backendUnset: beginning second init")
+
 		// Unset
 		if err := ioutil.WriteFile("main.tf", []byte(""), 0644); err != nil {
 			t.Fatalf("err: %s", err)
 		}
 
-		ui := new(cli.MockUi)
+		ui := cli.NewMockUi()
 		c := &InitCommand{
 			Meta: Meta{
 				testingOverrides: metaOverridesForProvider(testProvider()),
@@ -278,9 +314,11 @@ func TestInit_backendUnset(t *testing.T) {
 		if code := c.Run(args); code != 0 {
 			t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
 		}
+		log.Printf("[TRACE] TestInit_backendUnset: second init complete")
+		t.Logf("Second run output:\n%s", ui.OutputWriter.String())
+		t.Logf("Second run errors:\n%s", ui.ErrorWriter.String())
 
-		s := testStateRead(t, filepath.Join(
-			DefaultDataDir, DefaultStateFilename))
+		s := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
 		if !s.Backend.Empty() {
 			t.Fatal("should not have backend config")
 		}
@@ -308,9 +346,9 @@ func TestInit_backendConfigFile(t *testing.T) {
 	}
 
 	// Read our saved backend config and verify we have our settings
-	state := testStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
-	if v := state.Backend.Config["path"]; v != "hello" {
-		t.Fatalf("bad: %#v", v)
+	state := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	if got, want := normalizeJSON(t, state.Backend.ConfigRaw), `{"path":"hello","workspace_dir":null}`; got != want {
+		t.Errorf("wrong config\ngot:  %s\nwant: %s", got, want)
 	}
 }
 
@@ -340,9 +378,9 @@ func TestInit_backendConfigFileChange(t *testing.T) {
 	}
 
 	// Read our saved backend config and verify we have our settings
-	state := testStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
-	if v := state.Backend.Config["path"]; v != "hello" {
-		t.Fatalf("bad: %#v", v)
+	state := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	if got, want := normalizeJSON(t, state.Backend.ConfigRaw), `{"path":"hello","workspace_dir":null}`; got != want {
+		t.Errorf("wrong config\ngot:  %s\nwant: %s", got, want)
 	}
 }
 
@@ -367,9 +405,142 @@ func TestInit_backendConfigKV(t *testing.T) {
 	}
 
 	// Read our saved backend config and verify we have our settings
-	state := testStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
-	if v := state.Backend.Config["path"]; v != "hello" {
-		t.Fatalf("bad: %#v", v)
+	state := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	if got, want := normalizeJSON(t, state.Backend.ConfigRaw), `{"path":"hello","workspace_dir":null}`; got != want {
+		t.Errorf("wrong config\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestInit_backendConfigKVReInit(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("init-backend-config-kv"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := new(cli.MockUi)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{"-backend-config", "path=test"}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+
+	ui = new(cli.MockUi)
+	c = &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	// a second init should require no changes, nor should it change the backend.
+	args = []string{"-input=false"}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+
+	// make sure the backend is configured how we expect
+	configState := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	cfg := map[string]interface{}{}
+	if err := json.Unmarshal(configState.Backend.ConfigRaw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg["path"] != "test" {
+		t.Fatalf(`expected backend path="test", got path="%v"`, cfg["path"])
+	}
+
+	// override the -backend-config options by settings
+	args = []string{"-input=false", "-backend-config", ""}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+
+	// make sure the backend is configured how we expect
+	configState = testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	cfg = map[string]interface{}{}
+	if err := json.Unmarshal(configState.Backend.ConfigRaw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg["path"] != nil {
+		t.Fatalf(`expected backend path="<nil>", got path="%v"`, cfg["path"])
+	}
+}
+
+func TestInit_backendConfigKVReInitWithConfigDiff(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("init-backend"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := new(cli.MockUi)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{"-input=false"}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+
+	ui = new(cli.MockUi)
+	c = &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	// a second init with identical config should require no changes, nor
+	// should it change the backend.
+	args = []string{"-input=false", "-backend-config", "path=foo"}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+
+	// make sure the backend is configured how we expect
+	configState := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	cfg := map[string]interface{}{}
+	if err := json.Unmarshal(configState.Backend.ConfigRaw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg["path"] != "foo" {
+		t.Fatalf(`expected backend path="foo", got path="%v"`, cfg["foo"])
+	}
+}
+
+func TestInit_backendCli_no_config_block(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("init"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := new(cli.MockUi)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{"-backend-config", "path=test"}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("got exit status %d; want 0\nstderr:\n%s\n\nstdout:\n%s", code, ui.ErrorWriter.String(), ui.OutputWriter.String())
+	}
+
+	errMsg := ui.ErrorWriter.String()
+	if !strings.Contains(errMsg, "Warning: Missing backend configuration") {
+		t.Fatal("expected missing backend block warning, got", errMsg)
 	}
 }
 
@@ -416,11 +587,13 @@ func TestInit_backendReinitWithExtra(t *testing.T) {
 
 	m := testMetaBackend(t, nil)
 	opts := &BackendOpts{
-		ConfigExtra: map[string]interface{}{"path": "hello"},
-		Init:        true,
+		ConfigOverride: configs.SynthBody("synth", map[string]cty.Value{
+			"path": cty.StringVal("hello"),
+		}),
+		Init: true,
 	}
 
-	b, err := m.backendConfig(opts)
+	_, cHash, err := m.backendConfig(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,29 +612,24 @@ func TestInit_backendReinitWithExtra(t *testing.T) {
 	}
 
 	// Read our saved backend config and verify we have our settings
-	state := testStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
-	if v := state.Backend.Config["path"]; v != "hello" {
-		t.Fatalf("bad: %#v", v)
+	state := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	if got, want := normalizeJSON(t, state.Backend.ConfigRaw), `{"path":"hello","workspace_dir":null}`; got != want {
+		t.Errorf("wrong config\ngot:  %s\nwant: %s", got, want)
 	}
 
-	if state.Backend.Hash != b.Hash {
+	if state.Backend.Hash != uint64(cHash) {
 		t.Fatal("mismatched state and config backend hashes")
-	}
-
-	if state.Backend.Rehash() != b.Rehash() {
-		t.Fatal("mismatched state and config re-hashes")
 	}
 
 	// init again and make sure nothing changes
 	if code := c.Run(args); code != 0 {
 		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
 	}
-	state = testStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
-	if v := state.Backend.Config["path"]; v != "hello" {
-		t.Fatalf("bad: %#v", v)
+	state = testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	if got, want := normalizeJSON(t, state.Backend.ConfigRaw), `{"path":"hello","workspace_dir":null}`; got != want {
+		t.Errorf("wrong config\ngot:  %s\nwant: %s", got, want)
 	}
-
-	if state.Backend.Hash != b.Hash {
+	if state.Backend.Hash != uint64(cHash) {
 		t.Fatal("mismatched state and config backend hashes")
 	}
 }
@@ -486,9 +654,9 @@ func TestInit_backendReinitConfigToExtra(t *testing.T) {
 	}
 
 	// Read our saved backend config and verify we have our settings
-	state := testStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
-	if v := state.Backend.Config["path"]; v != "foo" {
-		t.Fatalf("bad: %#v", v)
+	state := testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	if got, want := normalizeJSON(t, state.Backend.ConfigRaw), `{"path":"foo","workspace_dir":null}`; got != want {
+		t.Errorf("wrong config\ngot:  %s\nwant: %s", got, want)
 	}
 
 	backendHash := state.Backend.Hash
@@ -499,11 +667,23 @@ func TestInit_backendReinitConfigToExtra(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// We need a fresh InitCommand here because the old one now has our configuration
+	// file cached inside it, so it won't re-read the modification we just made.
+	c = &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
 	args := []string{"-input=false", "-backend-config=path=foo"}
 	if code := c.Run(args); code != 0 {
 		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
 	}
-	state = testStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	state = testDataStateRead(t, filepath.Join(DefaultDataDir, DefaultStateFilename))
+	if got, want := normalizeJSON(t, state.Backend.ConfigRaw), `{"path":"foo","workspace_dir":null}`; got != want {
+		t.Errorf("wrong config after moving to arg\ngot:  %s\nwant: %s", got, want)
+	}
 
 	if state.Backend.Hash == backendHash {
 		t.Fatal("state.Backend.Hash was not updated")
@@ -530,7 +710,56 @@ func TestInit_inputFalse(t *testing.T) {
 		t.Fatalf("bad: \n%s", ui.ErrorWriter)
 	}
 
+	// write different states for foo and bar
+	fooState := states.BuildState(func(s *states.SyncState) {
+		s.SetOutputValue(
+			addrs.OutputValue{Name: "foo"}.Absolute(addrs.RootModuleInstance),
+			cty.StringVal("foo"),
+			false, // not sensitive
+		)
+	})
+	if err := statemgr.NewFilesystem("foo").WriteState(fooState); err != nil {
+		t.Fatal(err)
+	}
+	barState := states.BuildState(func(s *states.SyncState) {
+		s.SetOutputValue(
+			addrs.OutputValue{Name: "bar"}.Absolute(addrs.RootModuleInstance),
+			cty.StringVal("bar"),
+			false, // not sensitive
+		)
+	})
+	if err := statemgr.NewFilesystem("bar").WriteState(barState); err != nil {
+		t.Fatal(err)
+	}
+
+	ui = new(cli.MockUi)
+	c = &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
 	args = []string{"-input=false", "-backend-config=path=bar"}
+	if code := c.Run(args); code == 0 {
+		t.Fatal("init should have failed", ui.OutputWriter)
+	}
+
+	errMsg := ui.ErrorWriter.String()
+	if !strings.Contains(errMsg, "input disabled") {
+		t.Fatal("expected input disabled error, got", errMsg)
+	}
+
+	ui = new(cli.MockUi)
+	c = &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	// A missing input=false should abort rather than loop infinitely
+	args = []string{"-backend-config=path=baz"}
 	if code := c.Run(args); code == 0 {
 		t.Fatal("init should have failed", ui.OutputWriter)
 	}
@@ -543,12 +772,12 @@ func TestInit_getProvider(t *testing.T) {
 	defer os.RemoveAll(td)
 	defer testChdir(t, td)()
 
+	overrides := metaOverridesForProvider(testProvider())
 	ui := new(cli.MockUi)
 	m := Meta{
-		testingOverrides: metaOverridesForProvider(testProvider()),
+		testingOverrides: overrides,
 		Ui:               ui,
 	}
-
 	installer := &mockProviderInstaller{
 		Providers: map[string][]string{
 			// looking for an exact version
@@ -591,6 +820,36 @@ func TestInit_getProvider(t *testing.T) {
 	if _, err := os.Stat(betweenPath); os.IsNotExist(err) {
 		t.Fatal("provider 'between' not downloaded")
 	}
+
+	t.Run("future-state", func(t *testing.T) {
+		// getting providers should fail if a state from a newer version of
+		// terraform exists, since InitCommand.getProviders needs to inspect that
+		// state.
+		s := terraform.NewState()
+		s.TFVersion = "100.1.0"
+		local := &state.LocalState{
+			Path: local.DefaultStateFilename,
+		}
+		if err := local.WriteState(s); err != nil {
+			t.Fatal(err)
+		}
+
+		ui := new(cli.MockUi)
+		m.Ui = ui
+		c := &InitCommand{
+			Meta:              m,
+			providerInstaller: installer,
+		}
+
+		if code := c.Run(nil); code == 0 {
+			t.Fatal("expected error, got:", ui.OutputWriter)
+		}
+
+		errMsg := ui.ErrorWriter.String()
+		if !strings.Contains(errMsg, "which is newer than current") {
+			t.Fatal("unexpected error:", errMsg)
+		}
+	})
 }
 
 // make sure we can locate providers in various paths
@@ -840,8 +1099,8 @@ func TestInit_getProviderHaveLegacyVersion(t *testing.T) {
 			testingOverrides: metaOverridesForProvider(testProvider()),
 			Ui:               ui,
 		},
-		providerInstaller: callbackPluginInstaller(func(provider string, req discovery.Constraints) (discovery.PluginMeta, error) {
-			return discovery.PluginMeta{}, fmt.Errorf("EXPECTED PROVIDER ERROR %s", provider)
+		providerInstaller: callbackPluginInstaller(func(provider string, req discovery.Constraints) (discovery.PluginMeta, tfdiags.Diagnostics, error) {
+			return discovery.PluginMeta{}, tfdiags.Diagnostics{}, fmt.Errorf("EXPECTED PROVIDER ERROR %s", provider)
 		}),
 	}
 
@@ -855,14 +1114,14 @@ func TestInit_getProviderHaveLegacyVersion(t *testing.T) {
 	}
 }
 
-func TestInit_getProviderCheckRequiredVersion(t *testing.T) {
+func TestInit_checkRequiredVersion(t *testing.T) {
 	// Create a temporary working directory that is empty
 	td := tempDir(t)
 	copy.CopyDir(testFixturePath("init-check-required-version"), td)
 	defer os.RemoveAll(td)
 	defer testChdir(t, td)()
 
-	ui := new(cli.MockUi)
+	ui := cli.NewMockUi()
 	c := &InitCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(testProvider()),
@@ -872,7 +1131,7 @@ func TestInit_getProviderCheckRequiredVersion(t *testing.T) {
 
 	args := []string{}
 	if code := c.Run(args); code != 1 {
-		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+		t.Fatalf("got exit status %d; want 1\nstderr:\n%s\n\nstdout:\n%s", code, ui.ErrorWriter.String(), ui.OutputWriter.String())
 	}
 }
 
@@ -923,6 +1182,67 @@ func TestInit_providerLockFile(t *testing.T) {
 `)
 	if string(buf) != wantLockFile {
 		t.Errorf("wrong provider lock file contents\ngot:  %s\nwant: %s", buf, wantLockFile)
+	}
+}
+
+func TestInit_pluginDirReset(t *testing.T) {
+	td := testTempDir(t)
+	defer testChdir(t, td)()
+
+	ui := new(cli.MockUi)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+		providerInstaller: &mockProviderInstaller{},
+	}
+
+	// make our vendor paths
+	pluginPath := []string{"a", "b", "c"}
+	for _, p := range pluginPath {
+		if err := os.MkdirAll(p, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// run once and save the -plugin-dir
+	args := []string{"-plugin-dir", "a"}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter)
+	}
+
+	pluginDirs, err := c.loadPluginPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pluginDirs) != 1 || pluginDirs[0] != "a" {
+		t.Fatalf(`expected plugin dir ["a"], got %q`, pluginDirs)
+	}
+
+	ui = new(cli.MockUi)
+	c = &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+		providerInstaller: &mockProviderInstaller{},
+	}
+
+	// make sure we remove the plugin-dir record
+	args = []string{"-plugin-dir="}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter)
+	}
+
+	pluginDirs, err = c.loadPluginPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pluginDirs) != 0 {
+		t.Fatalf("expected no plugin dirs got %q", pluginDirs)
 	}
 }
 
@@ -989,9 +1309,9 @@ func TestInit_pluginDirProvidersDoesNotGet(t *testing.T) {
 
 	c := &InitCommand{
 		Meta: m,
-		providerInstaller: callbackPluginInstaller(func(provider string, req discovery.Constraints) (discovery.PluginMeta, error) {
+		providerInstaller: callbackPluginInstaller(func(provider string, req discovery.Constraints) (discovery.PluginMeta, tfdiags.Diagnostics, error) {
 			t.Fatalf("plugin installer should not have been called for %q", provider)
-			return discovery.PluginMeta{}, nil
+			return discovery.PluginMeta{}, tfdiags.Diagnostics{}, nil
 		}),
 	}
 
@@ -1021,5 +1341,136 @@ func TestInit_pluginDirProvidersDoesNotGet(t *testing.T) {
 	if code := c.Run(args); code == 0 {
 		// should have been an error
 		t.Fatalf("bad: \n%s", ui.OutputWriter)
+	}
+}
+
+// Verify that plugin-dir doesn't prevent discovery of internal providers
+func TestInit_pluginWithInternal(t *testing.T) {
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("init-internal"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := new(cli.MockUi)
+	m := Meta{
+		testingOverrides: metaOverridesForProvider(testProvider()),
+		Ui:               ui,
+	}
+
+	c := &InitCommand{
+		Meta: m,
+	}
+
+	args := []string{"-plugin-dir", "./"}
+	//args := []string{}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("error: %s", ui.ErrorWriter)
+	}
+}
+
+func TestInit_012UpgradeNeeded(t *testing.T) {
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("init-012upgrade"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := cli.NewMockUi()
+	m := Meta{
+		testingOverrides: metaOverridesForProvider(testProvider()),
+		Ui:               ui,
+	}
+
+	installer := &mockProviderInstaller{
+		Providers: map[string][]string{
+			"null": []string{"1.0.0"},
+		},
+		Dir: m.pluginDir(),
+	}
+
+	c := &InitCommand{
+		Meta:              m,
+		providerInstaller: installer,
+	}
+
+	args := []string{}
+	if code := c.Run(args); code != 0 {
+		t.Errorf("wrong exit status %d; want 0\nerror output:\n%s", code, ui.ErrorWriter.String())
+	}
+
+	output := ui.OutputWriter.String()
+	if !strings.Contains(output, "terraform 0.12upgrade") {
+		t.Errorf("doesn't look like we detected the need for config upgrade:\n%s", output)
+	}
+}
+
+func TestInit_012UpgradeNeededInAutomation(t *testing.T) {
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("init-012upgrade"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := cli.NewMockUi()
+	m := Meta{
+		testingOverrides:    metaOverridesForProvider(testProvider()),
+		Ui:                  ui,
+		RunningInAutomation: true,
+	}
+
+	installer := &mockProviderInstaller{
+		Providers: map[string][]string{
+			"null": []string{"1.0.0"},
+		},
+		Dir: m.pluginDir(),
+	}
+
+	c := &InitCommand{
+		Meta:              m,
+		providerInstaller: installer,
+	}
+
+	args := []string{}
+	if code := c.Run(args); code != 0 {
+		t.Errorf("wrong exit status %d; want 0\nerror output:\n%s", code, ui.ErrorWriter.String())
+	}
+
+	output := ui.OutputWriter.String()
+	if !strings.Contains(output, "Run terraform init for this configuration at a shell prompt") {
+		t.Errorf("doesn't look like we instructed to run Terraform locally:\n%s", output)
+	}
+	if strings.Contains(output, "terraform 0.12upgrade") {
+		// We don't prompt with an exact command in automation mode, since
+		// the upgrade process is interactive and so it cannot be run in
+		// automation.
+		t.Errorf("looks like we incorrectly gave an upgrade command to run:\n%s", output)
+	}
+}
+
+func TestInit_syntaxErrorVersionSniff(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("init-sniff-version-error"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	ui := new(cli.MockUi)
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+		},
+	}
+
+	args := []string{}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: \n%s", ui.ErrorWriter.String())
+	}
+
+	// Check output.
+	// Currently, this lands in the "upgrade may be needed" codepath, because
+	// the intentional syntax error in our test fixture is something that
+	// "terraform 0.12upgrade" could fix.
+	output := ui.OutputWriter.String()
+	if got, want := output, "Terraform has initialized, but configuration upgrades may be needed"; !strings.Contains(got, want) {
+		t.Fatalf("wrong output\ngot:\n%s\n\nwant: message containing %q", got, want)
 	}
 }

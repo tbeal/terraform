@@ -3,15 +3,16 @@ package terraform
 import (
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/hashicorp/terraform/config/module"
+	"github.com/go-test/deep"
+
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/moduledeps"
 	"github.com/hashicorp/terraform/plugin/discovery"
 )
 
 func TestModuleTreeDependencies(t *testing.T) {
 	tests := map[string]struct {
-		ConfigDir string // directory name from test-fixtures dir
+		ConfigDir string // directory name from testdata dir
 		State     *State
 		Want      *moduledeps.Module
 	}{
@@ -73,8 +74,7 @@ func TestModuleTreeDependencies(t *testing.T) {
 				Providers: moduledeps.Providers{
 					"foo": moduledeps.ProviderDependency{
 						Constraints: discovery.AllVersions,
-						//Reason:      moduledeps.ProviderDependencyImplicit,
-						Reason: moduledeps.ProviderDependencyExplicit,
+						Reason:      moduledeps.ProviderDependencyImplicit,
 					},
 					"foo.baz": moduledeps.ProviderDependency{
 						Constraints: discovery.AllVersions,
@@ -119,27 +119,24 @@ func TestModuleTreeDependencies(t *testing.T) {
 						Providers: moduledeps.Providers{
 							"foo": moduledeps.ProviderDependency{
 								Constraints: discovery.AllVersions,
-								//Reason:      moduledeps.ProviderDependencyInherited,
-								Reason: moduledeps.ProviderDependencyExplicit,
+								Reason:      moduledeps.ProviderDependencyInherited,
 							},
 							"baz": moduledeps.ProviderDependency{
 								Constraints: discovery.AllVersions,
-								//Reason:      moduledeps.ProviderDependencyImplicit,
-								Reason: moduledeps.ProviderDependencyExplicit,
+								Reason:      moduledeps.ProviderDependencyImplicit,
 							},
 						},
 						Children: []*moduledeps.Module{
 							{
 								Name: "grandchild",
 								Providers: moduledeps.Providers{
+									"bar": moduledeps.ProviderDependency{
+										Constraints: discovery.AllVersions,
+										Reason:      moduledeps.ProviderDependencyInherited,
+									},
 									"foo": moduledeps.ProviderDependency{
 										Constraints: discovery.AllVersions,
 										Reason:      moduledeps.ProviderDependencyExplicit,
-									},
-									"bar": moduledeps.ProviderDependency{
-										Constraints: discovery.AllVersions,
-										//Reason:      moduledeps.ProviderDependencyInherited,
-										Reason: moduledeps.ProviderDependencyExplicit,
 									},
 								},
 							},
@@ -227,7 +224,8 @@ func TestModuleTreeDependencies(t *testing.T) {
 				},
 				Children: []*moduledeps.Module{
 					{
-						Name: "child",
+						Name:      "child",
+						Providers: make(moduledeps.Providers),
 						Children: []*moduledeps.Module{
 							{
 								Name: "grandchild",
@@ -247,18 +245,14 @@ func TestModuleTreeDependencies(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			var root *module.Tree
+			var root *configs.Config
 			if test.ConfigDir != "" {
 				root = testModule(t, test.ConfigDir)
 			}
 
-			got := ModuleTreeDependencies(root, test.State)
-			if !got.Equal(test.Want) {
-				t.Errorf(
-					"wrong dependency tree\ngot:  %s\nwant: %s",
-					spew.Sdump(got),
-					spew.Sdump(test.Want),
-				)
+			got := ConfigTreeDependencies(root, MustShimLegacyState(test.State))
+			for _, problem := range deep.Equal(got, test.Want) {
+				t.Error(problem)
 			}
 		})
 	}
